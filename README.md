@@ -17,11 +17,20 @@ Open the URL printed by Vite.
 
 TubeMap includes a Vite dev-server bridge at `/api/ai/compose`. Configure the command from the composer settings in the app.
 
-Example settings:
+Pick a provider in the composer settings dropdown, or enter a custom command.
+
+Codex CLI:
 
 ```text
 AI command: codex
 AI args: exec --json -m gpt-5.2
+```
+
+Claude CLI:
+
+```text
+AI command: claude
+AI args: -p --output-format json
 ```
 
 The CLI should return JSON in this shape:

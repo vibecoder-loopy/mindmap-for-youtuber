@@ -1,13 +1,18 @@
 import {
+  BaseEdge,
   Background,
   Controls,
   Handle,
   MiniMap,
   Position,
   ReactFlow,
+  ReactFlowProvider,
   addEdge,
   applyEdgeChanges,
   applyNodeChanges,
+  getStraightPath,
+  useInternalNode,
+  useReactFlow,
 } from "@xyflow/react";
 import {
   Bot,
@@ -25,16 +30,35 @@ import {
   Sparkles,
   Trash2,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+import { layoutWithDagre, layoutWithForce } from "./layouts.js";
 
 const STORAGE_KEY = "tubemap-state-v2";
+const PROVIDER_PRESETS = {
+  codex: { label: "Codex CLI", command: "codex", args: "exec --json -m gpt-5.2" },
+  claude: { label: "Claude CLI", command: "claude", args: "-p --output-format json" },
+  custom: { label: "커스텀", command: "", args: "" },
+};
 const DEFAULT_AI_SETTINGS = {
+  provider: "codex",
   command: "codex",
   args: "exec --json -m gpt-5.2",
   cwd: "",
   timeoutMs: 60000,
   jsonMode: true,
 };
+
+const KNOWN_ACTION_TYPES = new Set([
+  "create_node",
+  "update_node",
+  "delete_node",
+  "create_edge",
+  "delete_edge",
+  "open_markdown",
+  "update_markdown",
+  "delete_markdown",
+]);
 
 const NODE_KINDS = [
   "Channel",
@@ -142,14 +166,16 @@ function createInitialState() {
 }
 
 function normalizeAiSettings(settings = {}) {
-  const command = settings.command?.trim() || DEFAULT_AI_SETTINGS.command;
-  let args = settings.args?.trim() || DEFAULT_AI_SETTINGS.args;
+  const provider = settings.provider || (settings.command?.startsWith("claude") ? "claude" : "codex");
+  const command = settings.command?.trim() || PROVIDER_PRESETS[provider]?.command || DEFAULT_AI_SETTINGS.command;
+  let args = settings.args?.trim() || PROVIDER_PRESETS[provider]?.args || DEFAULT_AI_SETTINGS.args;
   if (command === "codex" && !/(^|\s)-m(\s|=)|(^|\s)--model(\s|=)/.test(args)) {
     args = `${args} -m gpt-5.2`;
   }
   return {
     ...DEFAULT_AI_SETTINGS,
     ...settings,
+    provider,
     command,
     args,
   };
@@ -187,18 +213,130 @@ function TubeNode({ data, selected }) {
   );
 }
 
-function nodeToFlowNode(node, selectedNodeId, view, index, total) {
-  const graphRadius = Math.max(220, total * 34);
-  const angle = (index / Math.max(total, 1)) * Math.PI * 2 - Math.PI / 2;
-  const graphPosition = {
-    x: 460 + Math.cos(angle) * graphRadius,
-    y: 280 + Math.sin(angle) * graphRadius,
-  };
+function FloatingEdge({ id, source, target, style, data }) {
+  const sourceNode = useInternalNode(source);
+  const targetNode = useInternalNode(target);
+  if (!sourceNode || !targetNode) return null;
+  const sx = (sourceNode.internals.positionAbsolute?.x ?? sourceNode.position?.x ?? 0) + (sourceNode.measured?.width ?? 0) / 2;
+  const sy = (sourceNode.internals.positionAbsolute?.y ?? sourceNode.position?.y ?? 0) + (sourceNode.measured?.height ?? 0) / 2;
+  const tx = (targetNode.internals.positionAbsolute?.x ?? targetNode.position?.x ?? 0) + (targetNode.measured?.width ?? 0) / 2;
+  const ty = (targetNode.internals.positionAbsolute?.y ?? targetNode.position?.y ?? 0) + (targetNode.measured?.height ?? 0) / 2;
+  const [edgePath] = getStraightPath({ sourceX: sx, sourceY: sy, targetX: tx, targetY: ty });
+  return <BaseEdge id={id} path={edgePath} style={style} interactionWidth={data?.interactionWidth ?? 14} />;
+}
 
+const EDGE_TYPES = { floating: FloatingEdge };
+
+function GraphDot({ data, selected }) {
+  const size = data.size ?? 11;
+  const stateClass = selected
+    ? "is-selected"
+    : data.connected
+      ? "is-connected"
+      : data.hasSelection
+        ? "is-dim"
+        : "";
+  return (
+    <div className={`graph-dot ${stateClass}`} style={{ width: size, height: size }}>
+      <span className="graph-dot-circle" style={{ background: data.color }} />
+      <span className="graph-dot-label">{data.title}</span>
+      <Handle type="target" position={Position.Top} className="graph-dot-handle" />
+      <Handle type="source" position={Position.Top} className="graph-dot-handle" />
+    </div>
+  );
+}
+
+const NODE_TYPES = { tube: TubeNode, dot: GraphDot };
+
+function CanvasArea({
+  sourceNodes,
+  edges,
+  view,
+  onConnect,
+  onSelectNode,
+  onNodePositionsCommit,
+  onEdgesChange,
+  instanceRef,
+}) {
+  const reactFlow = useReactFlow();
+  const [flowNodes, setFlowNodes] = useState(sourceNodes);
+
+  useEffect(() => {
+    instanceRef.current = reactFlow;
+  }, [reactFlow, instanceRef]);
+
+  useEffect(() => {
+    setFlowNodes((current) => {
+      const byId = new Map(current.map((node) => [node.id, node]));
+      return sourceNodes.map((incoming) => {
+        const existing = byId.get(incoming.id);
+        if (!existing) return incoming;
+        return {
+          ...incoming,
+          measured: existing.measured ?? incoming.measured,
+          width: existing.width ?? incoming.width,
+          height: existing.height ?? incoming.height,
+        };
+      });
+    });
+  }, [sourceNodes]);
+
+  const handleNodesChange = useCallback(
+    (changes) => {
+      setFlowNodes((current) => applyNodeChanges(changes, current));
+      const positionCommits = changes
+        .filter((change) => change.type === "position" && change.position && change.dragging === false)
+        .map((change) => ({ id: change.id, position: change.position }));
+      if (positionCommits.length) onNodePositionsCommit(positionCommits);
+    },
+    [onNodePositionsCommit],
+  );
+
+  const isGraph = view === "graph";
+
+  return (
+    <div className={`flow-stage ${isGraph ? "is-graph" : "is-map"}`}>
+      <ReactFlow
+        nodes={flowNodes}
+        edges={edges}
+        nodeTypes={NODE_TYPES}
+        edgeTypes={EDGE_TYPES}
+        onNodesChange={handleNodesChange}
+        onEdgesChange={onEdgesChange}
+        onConnect={onConnect}
+        onNodeClick={(_, node) => onSelectNode(node.id)}
+        onNodeDoubleClick={(_, node) => onSelectNode(node.id)}
+        onPaneClick={isGraph ? () => onSelectNode(null) : undefined}
+        nodesConnectable={!isGraph}
+        edgesFocusable={!isGraph}
+        elementsSelectable
+        minZoom={isGraph ? 0.4 : 0.2}
+        maxZoom={isGraph ? 2.5 : 4}
+        proOptions={{ hideAttribution: true }}
+        fitView
+      >
+        {!isGraph && <Background color="#1f1f23" gap={28} />}
+        <Controls showInteractive={false} />
+        {!isGraph && (
+          <MiniMap nodeColor={(node) => node.data?.color || "#94a3b8"} maskColor="rgba(10, 10, 11, 0.72)" />
+        )}
+      </ReactFlow>
+      {isGraph && <div className="graph-vignette" aria-hidden />}
+    </div>
+  );
+}
+
+function nodeToFlowNode(node, selectedNodeId, view, graphMeta) {
+  const isGraph = view === "graph";
+  const position = isGraph ? graphMeta?.positions?.get(node.id) || node.position : node.position;
+  const degree = graphMeta?.degree?.get(node.id) || 0;
+  const size = isGraph ? clamp(8 + degree * 2.2, 8, 22) : undefined;
+  const connected = isGraph && graphMeta?.connectedToSelected?.has(node.id);
+  const hasSelection = isGraph && Boolean(selectedNodeId);
   return {
     id: node.id,
-    type: "tube",
-    position: view === "graph" ? graphPosition : node.position,
+    type: isGraph ? "dot" : "tube",
+    position,
     data: {
       title: node.title,
       kind: node.kind,
@@ -206,10 +344,18 @@ function nodeToFlowNode(node, selectedNodeId, view, index, total) {
       summary: node.summary || "",
       color: KIND_COLORS[node.kind] || "#94a3b8",
       status: statusForNode(node),
+      size,
+      connected,
+      hasSelection,
+      degree,
     },
     selected: node.id === selectedNodeId,
-    draggable: view === "map",
+    draggable: !isGraph,
   };
+}
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
 }
 
 function statusForNode(node) {
@@ -495,28 +641,50 @@ function MarkdownPanel({
   );
 }
 
-function AiComposer({ settings, setSettings, onSubmit, log }) {
+function AiComposer({ settings, setSettings, onSubmit, log, pending }) {
   const [message, setMessage] = useState("");
   const [showSettings, setShowSettings] = useState(false);
 
   const submit = () => {
+    if (pending) return;
     const trimmed = message.trim();
     if (!trimmed) return;
     onSubmit(trimmed);
     setMessage("");
   };
 
+  const providerLabel = PROVIDER_PRESETS[settings.provider]?.label || settings.command || "AI";
+
   return (
     <div className="composer-shell">
       {showSettings && (
         <div className="settings-popover">
           <label>
+            AI 프로바이더
+            <select
+              value={settings.provider || "codex"}
+              onChange={(event) => {
+                const provider = event.target.value;
+                const preset = PROVIDER_PRESETS[provider];
+                setSettings({
+                  ...settings,
+                  provider,
+                  ...(provider !== "custom" && preset ? { command: preset.command, args: preset.args } : {}),
+                });
+              }}
+            >
+              {Object.entries(PROVIDER_PRESETS).map(([key, preset]) => (
+                <option key={key} value={key}>{preset.label}</option>
+              ))}
+            </select>
+          </label>
+          <label>
             AI 커맨드
-            <input value={settings.command} onChange={(event) => setSettings({ ...settings, command: event.target.value })} placeholder="codex" />
+            <input value={settings.command} onChange={(event) => setSettings({ ...settings, command: event.target.value, provider: "custom" })} placeholder="codex" />
           </label>
           <label>
             AI 인자
-            <input value={settings.args} onChange={(event) => setSettings({ ...settings, args: event.target.value })} placeholder="exec --json" />
+            <input value={settings.args} onChange={(event) => setSettings({ ...settings, args: event.target.value, provider: "custom" })} placeholder="exec --json" />
           </label>
           <label>
             작업 폴더
@@ -538,8 +706,14 @@ function AiComposer({ settings, setSettings, onSubmit, log }) {
             {item.message}
           </div>
         ))}
+        {pending && (
+          <div className="pending" role="status" aria-live="polite">
+            <span className="pending-dots"><span /><span /><span /></span>
+            {providerLabel} 응답 생성 중...
+          </div>
+        )}
       </div>
-      <div className="composer">
+      <div className={`composer ${pending ? "pending" : ""}`}>
         <Bot size={19} />
         <textarea
           value={message}
@@ -550,13 +724,14 @@ function AiComposer({ settings, setSettings, onSubmit, log }) {
               submit();
             }
           }}
-          placeholder="AI에게 마인드맵 수정 요청..."
+          placeholder={pending ? `${providerLabel} 응답 대기 중...` : "AI에게 마인드맵 수정 요청..."}
+          disabled={pending}
         />
-        <button className="icon-button" onClick={() => setShowSettings(!showSettings)} title="AI CLI settings">
+        <button className="icon-button" onClick={() => setShowSettings(!showSettings)} title="AI CLI settings" disabled={pending}>
           <Settings size={18} />
         </button>
-        <button className="send-button" onClick={submit} title="Send">
-          <Send size={18} />
+        <button className="send-button" onClick={submit} title="Send" disabled={pending}>
+          {pending ? <span className="send-spinner" /> : <Send size={18} />}
         </button>
       </div>
     </div>
@@ -631,6 +806,8 @@ export default function App() {
   const [state, setState] = useState(loadState);
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [aiPending, setAiPending] = useState(false);
+  const reactFlowInstance = useRef(null);
 
   useEffect(() => {
     if (!state.hasOnboarded) setShowOnboarding(true);
@@ -657,27 +834,68 @@ export default function App() {
     () => getRelations(state.nodes, state.edges, state.markdowns, state.selectedNodeId),
     [state.nodes, state.edges, state.markdowns, state.selectedNodeId],
   );
-  const nodeTypes = useMemo(() => ({ tube: TubeNode }), []);
+  const graphLayout = useMemo(() => {
+    if (state.view !== "graph") return null;
+    const degree = new Map();
+    for (const edge of state.edges) {
+      degree.set(edge.source, (degree.get(edge.source) || 0) + 1);
+      degree.set(edge.target, (degree.get(edge.target) || 0) + 1);
+    }
+    const positions = layoutWithForce(state.nodes, state.edges);
+    return { degree, positions };
+  }, [state.view, state.nodes, state.edges]);
+
+  const connectedToSelected = useMemo(() => {
+    if (state.view !== "graph" || !state.selectedNodeId) return null;
+    const set = new Set();
+    for (const edge of state.edges) {
+      if (edge.source === state.selectedNodeId) set.add(edge.target);
+      if (edge.target === state.selectedNodeId) set.add(edge.source);
+    }
+    return set;
+  }, [state.view, state.edges, state.selectedNodeId]);
+
+  const graphMeta = useMemo(() => {
+    if (!graphLayout) return null;
+    return { ...graphLayout, connectedToSelected };
+  }, [graphLayout, connectedToSelected]);
   const flowNodes = useMemo(
-    () => state.nodes.map((node, index) => nodeToFlowNode(node, state.selectedNodeId, state.view, index, state.nodes.length)),
-    [state.nodes, state.selectedNodeId, state.view],
+    () => state.nodes.map((node) => nodeToFlowNode(node, state.selectedNodeId, state.view, graphMeta)),
+    [state.nodes, state.selectedNodeId, state.view, graphMeta],
   );
+  const flowEdges = useMemo(() => {
+    if (state.view !== "graph") return state.edges;
+    const selectedId = state.selectedNodeId;
+    return state.edges.map((edge) => {
+      const touchesSelected = selectedId && (edge.source === selectedId || edge.target === selectedId);
+      const dimmed = selectedId && !touchesSelected;
+      return {
+        ...edge,
+        label: undefined,
+        type: "floating",
+        animated: false,
+        style: {
+          stroke: touchesSelected
+            ? "oklch(0.66 0.21 25 / 0.78)"
+            : dimmed
+              ? "oklch(0.85 0.01 60 / 0.04)"
+              : "oklch(0.85 0.01 60 / 0.11)",
+          strokeWidth: touchesSelected ? 1.5 : 0.9,
+          transition: "stroke 320ms cubic-bezier(0.22, 1, 0.36, 1), stroke-width 320ms cubic-bezier(0.22, 1, 0.36, 1)",
+        },
+      };
+    });
+  }, [state.edges, state.view, state.selectedNodeId]);
 
   const setSettings = (settings) => setState((current) => ({ ...current, settings }));
 
-  const onNodesChange = useCallback((changes) => {
+  const commitNodePositions = useCallback((commits) => {
     setState((current) => {
-      const nextFlowNodes = applyNodeChanges(
-        changes,
-        current.nodes.map((node, index) => nodeToFlowNode(node, current.selectedNodeId, current.view, index, current.nodes.length)),
-      );
-      const positions = new Map(nextFlowNodes.map((node) => [node.id, node.position]));
+      if (current.view !== "map") return current;
+      const positionMap = new Map(commits.map((commit) => [commit.id, commit.position]));
       return {
         ...current,
-        nodes: current.nodes.map((node) => ({
-          ...node,
-          position: current.view === "map" ? positions.get(node.id) || node.position : node.position,
-        })),
+        nodes: current.nodes.map((node) => (positionMap.has(node.id) ? { ...node, position: positionMap.get(node.id) } : node)),
       };
     });
   }, []);
@@ -694,7 +912,7 @@ export default function App() {
   }, []);
 
   const selectNode = (nodeId) => {
-    setState((current) => ({ ...current, selectedNodeId: nodeId, panelOpen: true }));
+    setState((current) => ({ ...current, selectedNodeId: nodeId, panelOpen: nodeId ? true : current.panelOpen }));
   };
 
   const addNode = () => {
@@ -737,31 +955,53 @@ export default function App() {
   };
 
   const applyActions = (result) => {
+    const actions = result.actions || [];
+    if (!actions.length) {
+      appendLog("error", `AI가 액션을 반환하지 않았습니다. ${result.message ? "메시지: " + result.message : ""}`);
+      return;
+    }
+    let createdCount = 0;
+    let updatedCount = 0;
+    let deletedCount = 0;
+    let unknownCount = 0;
     setState((current) => {
       const created = new Map();
+      const anchor = current.nodes.find((node) => node.id === current.selectedNodeId) || current.nodes[0];
+      const baseX = anchor?.position?.x ?? 260;
+      const baseY = anchor?.position?.y ?? 240;
       let next = { ...current, nodes: [...current.nodes], edges: [...current.edges], markdowns: { ...current.markdowns } };
-      for (const [index, action] of (result.actions || []).entries()) {
+      for (const [index, action] of actions.entries()) {
+        const nodeData = action.node || action;
         if (action.type === "create_node") {
-          const id = action.node?.id || `ai-${Date.now()}-${index}`;
+          const id = nodeData.id || `ai-${Date.now()}-${index}`;
           created.set(`new:${index}`, id);
           next.nodes.push({
             id,
-            title: action.node?.title || "AI Node",
-            kind: NODE_KINDS.includes(action.node?.kind) ? action.node.kind : "Idea",
-            summary: action.node?.summary || "",
-            position: action.node?.position || { x: 260 + index * 190, y: 340 + index * 24 },
+            title: nodeData.title || "AI Node",
+            kind: NODE_KINDS.includes(nodeData.kind) ? nodeData.kind : "Idea",
+            summary: nodeData.summary || "",
+            position: validPosition(nodeData.position) || { x: baseX + 240 + index * 40, y: baseY + index * 90 },
           });
-          next.markdowns[id] = action.node?.markdown || `# ${action.node?.title || "AI 노드"}\n\n`;
+          next.markdowns[id] = nodeData.markdown || `# ${nodeData.title || "AI 노드"}\n\n`;
+          createdCount += 1;
+          continue;
         }
         if (action.type === "update_node") {
           const patch = action.patch || nodePatchFromAction(action);
+          if (patch.position) {
+            const safe = validPosition(patch.position);
+            if (safe) patch.position = safe;
+            else delete patch.position;
+          }
           next.nodes = next.nodes.map((node) => (node.id === resolveRef(actionNodeId(action), current.selectedNodeId, created) ? { ...node, ...patch } : node));
+          updatedCount += 1;
         }
         if (action.type === "delete_node") {
           const id = resolveRef(actionNodeId(action), current.selectedNodeId, created);
           next.nodes = next.nodes.filter((node) => node.id !== id);
           next.edges = next.edges.filter((edge) => edge.source !== id && edge.target !== id);
           delete next.markdowns[id];
+          deletedCount += 1;
         }
         if (action.type === "create_edge") {
           const source = resolveRef(action.from, current.selectedNodeId, created);
@@ -785,18 +1025,53 @@ export default function App() {
         if (action.type === "delete_markdown") {
           delete next.markdowns[resolveRef(actionNodeId(action), current.selectedNodeId, created)];
         }
+        if (!KNOWN_ACTION_TYPES.has(action.type)) {
+          unknownCount += 1;
+        }
+      }
+      const structuralChanged = actions.some((action) =>
+        ["create_node", "delete_node", "create_edge", "delete_edge"].includes(action.type),
+      );
+      if (structuralChanged && current.view === "map") {
+        next.nodes = layoutWithDagre(next.nodes, next.edges);
       }
       return next;
     });
-    appendLog("success", result.message || "AI 액션을 적용했습니다.");
+    const summary = [
+      result.message || "AI 액션 적용",
+      `${actions.length}개 액션`,
+      createdCount ? `+${createdCount}개 노드` : null,
+      updatedCount ? `${updatedCount}개 수정` : null,
+      deletedCount ? `-${deletedCount}개` : null,
+      unknownCount ? `(알 수 없는 액션 ${unknownCount}개 무시됨)` : null,
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    appendLog(unknownCount ? "error" : "success", summary);
+    if (createdCount + updatedCount + deletedCount > 0) {
+      const fit = (attempt = 0) => {
+        const instance = reactFlowInstance.current;
+        if (!instance) {
+          if (attempt < 10) window.setTimeout(() => fit(attempt + 1), 60);
+          return;
+        }
+        try {
+          instance.fitView({ padding: 0.25, duration: 500 });
+        } catch {
+          // ignore — viewport not ready yet
+        }
+      };
+      window.setTimeout(fit, 80);
+    }
   };
 
   const runAi = async (message) => {
     appendLog("user", message);
     if (!state.settings.command.trim()) {
-      appendLog("error", "AI CLI 설정이 없습니다. 설정에서 `codex`와 `exec --json -m gpt-5.2`를 확인하세요.");
+      appendLog("error", "AI CLI 설정이 없습니다. 설정에서 Codex(`codex exec --json`) 또는 Claude(`claude -p --output-format json`)를 선택하세요.");
       return;
     }
+    setAiPending(true);
     try {
       const response = await fetch("/api/ai/compose", {
         method: "POST",
@@ -820,6 +1095,8 @@ export default function App() {
       applyActions(payload.result);
     } catch (error) {
       appendLog("error", error.message);
+    } finally {
+      setAiPending(false);
     }
   };
 
@@ -829,7 +1106,15 @@ export default function App() {
       {showOnboarding && (
         <Onboarding
           onCreate={(url, notes) => {
-            setState((current) => ({ ...current, ...createStarterMap(url, notes), hasOnboarded: true }));
+            setState((current) => {
+              const starter = createStarterMap(url, notes);
+              return {
+                ...current,
+                ...starter,
+                nodes: layoutWithDagre(starter.nodes, starter.edges),
+                hasOnboarded: true,
+              };
+            });
             setShowOnboarding(false);
           }}
         />
@@ -862,6 +1147,35 @@ export default function App() {
             <Plus size={16} />
             노드
           </button>
+          <button onClick={() => reactFlowInstance.current?.fitView({ padding: 0.25, duration: 400 })} title="Fit view">
+            <Maximize2 size={16} />
+            Fit
+          </button>
+          <button
+            onClick={() => {
+              setState((current) => ({
+                ...current,
+                nodes: layoutWithDagre(current.nodes, current.edges),
+              }));
+              window.setTimeout(() => reactFlowInstance.current?.fitView({ padding: 0.25, duration: 400 }), 80);
+            }}
+            title="Auto layout (dagre)"
+          >
+            <Network size={16} />
+            Auto
+          </button>
+          <button
+            onClick={() => {
+              if (window.confirm("저장된 상태를 모두 초기화할까요?")) {
+                window.localStorage.removeItem(STORAGE_KEY);
+                window.location.reload();
+              }
+            }}
+            title="Reset workspace"
+          >
+            <Trash2 size={16} />
+            Reset
+          </button>
           <button onClick={() => setShowOnboarding(true)}>
             <Braces size={16} />
             온보딩
@@ -882,21 +1196,18 @@ export default function App() {
           onSelectNode={selectNode}
         />
         <section className="canvas">
-          <ReactFlow
-            nodes={flowNodes}
-            edges={state.edges}
-            nodeTypes={nodeTypes}
-            onNodesChange={onNodesChange}
-            onEdgesChange={onEdgesChange}
-            onConnect={onConnect}
-            onNodeClick={(_, node) => selectNode(node.id)}
-            onNodeDoubleClick={(_, node) => selectNode(node.id)}
-            fitView
-          >
-            <Background color="#1f1f23" gap={28} />
-            <Controls />
-            <MiniMap nodeColor={(node) => node.data.color} maskColor="rgba(10, 10, 11, 0.72)" />
-          </ReactFlow>
+          <ReactFlowProvider>
+            <CanvasArea
+              sourceNodes={flowNodes}
+              edges={flowEdges}
+              view={state.view}
+              onEdgesChange={onEdgesChange}
+              onConnect={onConnect}
+              onSelectNode={selectNode}
+              onNodePositionsCommit={commitNodePositions}
+              instanceRef={reactFlowInstance}
+            />
+          </ReactFlowProvider>
         </section>
 
         {state.panelOpen && (
@@ -914,9 +1225,17 @@ export default function App() {
         )}
       </main>
 
-      <AiComposer settings={state.settings} setSettings={setSettings} onSubmit={runAi} log={state.composerLog} />
+      <AiComposer settings={state.settings} setSettings={setSettings} onSubmit={runAi} log={state.composerLog} pending={aiPending} />
     </div>
   );
+}
+
+function validPosition(value) {
+  if (!value || typeof value !== "object") return null;
+  const x = Number(value.x);
+  const y = Number(value.y);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+  return { x, y };
 }
 
 function resolveRef(value, selectedNodeId, created) {

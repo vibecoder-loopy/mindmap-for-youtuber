@@ -1,6 +1,20 @@
 import react from "@vitejs/plugin-react";
 import { spawn } from "node:child_process";
+import { appendFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { defineConfig } from "vite";
+
+const DEBUG_LOG_PATH = resolve(process.cwd(), ".ai-bridge.log");
+
+function debugLog(...parts) {
+  const line = `[${new Date().toISOString()}] ${parts.map((p) => (typeof p === "string" ? p : JSON.stringify(p))).join(" ")}\n`;
+  try {
+    appendFileSync(DEBUG_LOG_PATH, line);
+  } catch {
+    // best-effort logging only
+  }
+  console.error(line.trimEnd());
+}
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -34,7 +48,22 @@ function buildPrompt({ message, state }) {
     {
       role: "TubeMap local CLI bridge",
       instruction:
-        "Return only one JSON object as your final answer. Use shape {\"message\": string, \"actions\": array}. Valid action types: create_node, update_node, delete_node, create_edge, delete_edge, open_markdown, update_markdown, delete_markdown. For node-targeted actions, use nodeId, not id. For create_edge, use from and to. Do not include Markdown fences, prose, or code blocks.",
+        "Return only one JSON object as your final answer. Use shape {\"message\": string, \"actions\": array}. Do not include Markdown fences, prose, or code blocks.",
+      actionSchema: {
+        create_node: { type: "create_node", node: { id: "optional", title: "string", kind: "Channel|Series|Video|Idea|Script|Research|Reference|Competitor|Keyword|Performance|Todo", summary: "string", markdown: "optional string", position: { x: "number", y: "number" } } },
+        update_node: { type: "update_node", nodeId: "string|'selected'", patch: { title: "optional", kind: "optional", summary: "optional" } },
+        delete_node: { type: "delete_node", nodeId: "string" },
+        create_edge: { type: "create_edge", from: "nodeId|'selected'|'new:0'", to: "nodeId|'selected'|'new:1'", label: "optional string" },
+        delete_edge: { type: "delete_edge", edgeId: "string" },
+        open_markdown: { type: "open_markdown", nodeId: "string" },
+        update_markdown: { type: "update_markdown", nodeId: "string", content: "full markdown string" },
+        delete_markdown: { type: "delete_markdown", nodeId: "string" },
+      },
+      hints: [
+        "When creating multiple nodes, reference them in subsequent create_edge actions via 'new:0', 'new:1' (their index in the actions array).",
+        "Skip the position field unless the user asked for a specific layout — defaults will be used.",
+        "Return at least one action; an empty actions array is invalid.",
+      ],
       userMessage: message,
       appState: state,
     },
@@ -47,12 +76,54 @@ function extractJson(stdout) {
   const trimmed = stdout.trim();
   if (!trimmed) throw new Error("The CLI returned no output.");
   try {
-    return JSON.parse(trimmed);
+    const parsed = JSON.parse(trimmed);
+    const found = findActionsObject(parsed);
+    if (found) return found;
   } catch {
-    const jsonlResult = extractJsonFromJsonl(trimmed);
-    if (jsonlResult) return jsonlResult;
-    return parseFirstJsonObject(trimmed);
+    // Not a single JSON document; fall through to other strategies.
   }
+  const jsonlResult = extractJsonFromJsonl(trimmed);
+  if (jsonlResult) return jsonlResult;
+  return parseFirstJsonObject(trimmed);
+}
+
+function findActionsObject(value) {
+  if (value == null) return null;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+      try {
+        return findActionsObject(JSON.parse(trimmed));
+      } catch {
+        // fall through to brace-scan on noisy strings (e.g. markdown fences).
+      }
+    }
+    return scanStringForActions(trimmed);
+  }
+  if (typeof value !== "object") return null;
+  if (!Array.isArray(value) && Array.isArray(value.actions)) return value;
+  const items = Array.isArray(value) ? value : Object.values(value);
+  for (const item of items) {
+    const found = findActionsObject(item);
+    if (found) return found;
+  }
+  return null;
+}
+
+function scanStringForActions(value) {
+  for (let start = value.indexOf("{"); start !== -1; start = value.indexOf("{", start + 1)) {
+    for (let end = value.lastIndexOf("}"); end > start; end = value.lastIndexOf("}", end - 1)) {
+      try {
+        const parsed = JSON.parse(value.slice(start, end + 1));
+        const found = findActionsObject(parsed);
+        if (found) return found;
+      } catch {
+        // Keep scanning.
+      }
+    }
+  }
+  return null;
 }
 
 function parseFirstJsonObject(value) {
@@ -60,7 +131,8 @@ function parseFirstJsonObject(value) {
     for (let end = value.lastIndexOf("}"); end > start; end = value.lastIndexOf("}", end - 1)) {
       try {
         const parsed = JSON.parse(value.slice(start, end + 1));
-        if (parsed && typeof parsed === "object" && Array.isArray(parsed.actions)) return parsed;
+        const found = findActionsObject(parsed);
+        if (found) return found;
       } catch {
         // Keep scanning for a valid object in noisy CLI output.
       }
@@ -91,7 +163,8 @@ function extractJsonFromJsonl(value) {
     if (!trimmedLine) continue;
     try {
       const event = JSON.parse(trimmedLine);
-      if (event && typeof event === "object" && Array.isArray(event.actions)) return event;
+      const found = findActionsObject(event);
+      if (found) return found;
       candidates.push(...collectStrings(event));
     } catch {
       candidates.push(trimmedLine);
@@ -119,6 +192,7 @@ function extractCliError(stdout, stderr) {
       const event = JSON.parse(trimmed);
       if (event?.type === "error" && event.message) messages.push(event.message);
       if (event?.type === "turn.failed" && event.error?.message) messages.push(event.error.message);
+      if (event?.is_error && typeof event.result === "string") messages.push(event.result);
     } catch {
       // Non-JSON progress output is not the error source we want.
     }
@@ -128,9 +202,25 @@ function extractCliError(stdout, stderr) {
   return stderr.trim() || stdout.trim();
 }
 
+const CLAUDE_SYSTEM_INSTRUCTION =
+  'You are a stateless TubeMap mutation engine. Output exactly one raw JSON object with shape {"message": string, "actions": array}. ' +
+  "Do not call any tools (no WebFetch, no WebSearch, no Bash, no file ops, no vidIQ). Do not ask the user permission or follow-up questions. " +
+  "Do not wrap the JSON in markdown fences. Do not add prose, explanations, or apologies. Return JSON only.";
+
+function applyProviderDefaults(command, args) {
+  if (command !== "claude") return args;
+  const joined = args.join(" ");
+  const additions = [];
+  if (!/(^|\s)--append-system-prompt(\s|=)/.test(joined) && !/(^|\s)--system-prompt(\s|=)/.test(joined)) {
+    additions.push("--append-system-prompt", CLAUDE_SYSTEM_INSTRUCTION);
+  }
+  return [...args, ...additions];
+}
+
 function runCli({ command, args, cwd, timeoutMs, prompt }) {
+  const finalArgs = applyProviderDefaults(command, args);
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, {
+    const child = spawn(command, finalArgs, {
       cwd: cwd || process.cwd(),
       shell: false,
       stdio: ["pipe", "pipe", "pipe"],
@@ -201,14 +291,29 @@ function localAiBridge() {
             prompt,
           });
 
-          sendJson(res, 200, {
-            result: extractJson(stdout),
-            debug: {
-              command: [command, ...args].join(" "),
-              stderr: stderr.trim(),
-            },
-          });
+          const finalArgs = applyProviderDefaults(command, args);
+          debugLog("REQUEST", { command, finalArgs, message: body.message });
+          debugLog("STDOUT", stdout.slice(0, 4000));
+          if (stderr.trim()) debugLog("STDERR", stderr.slice(0, 2000));
+          try {
+            const result = extractJson(stdout);
+            debugLog("RESULT", { actions: result.actions, message: result.message });
+            sendJson(res, 200, {
+              result,
+              debug: {
+                command: [command, ...finalArgs].join(" "),
+                stderr: stderr.trim(),
+              },
+            });
+          } catch (parseError) {
+            debugLog("PARSE_ERROR", parseError.message);
+            sendJson(res, 500, {
+              error: parseError.message,
+              preview: stdout.slice(0, 800),
+            });
+          }
         } catch (error) {
+          debugLog("BRIDGE_ERROR", error.message);
           sendJson(res, 500, { error: error.message });
         }
       });

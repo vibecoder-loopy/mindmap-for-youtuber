@@ -6,3 +6,4 @@ dist/
 .DS_Store
 .tubemap/
 *.local
+.ai-bridge.log
